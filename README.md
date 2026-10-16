@@ -64,6 +64,16 @@ Contoh: Paket A → Link 1 & 3, Paket B → Link 2, Paket C → Link 4.
 - **📊 Reset Statistik**: angka pendapatan & penjualan mulai dari nol, riwayat pesanan tetap aman. Bisa dikembalikan lewat **↩️ Tampilkan Semua Data Lagi**.
 - **🗑 Hapus Riwayat Pesanan**: menghapus permanen pesanan selesai (berhasil/ditolak/dibatalkan/kedaluwarsa). Backup CSV dikirim otomatis sebelum dihapus. Member aktif dan pesanan yang sedang diproses tidak ikut terhapus.
 
+## 💾 Backup & Restore
+`/admin` → **💾 Backup & Restore**
+- **Backup Lengkap (.db)**: semua data (pengaturan, paket, channel, promo, member, langganan, pesanan). Cocok untuk pindah server/akun Railway.
+- **Backup Pengaturan (.json)**: hanya pengaturan, paket, channel, pemetaan paket-channel, dan promo.
+- **Restore**: tekan **📥 Restore dari File**, kirim file `.db` / `.json` ke bot, cek ringkasan, lalu konfirmasi. Sebelum menimpa, bot otomatis mengirim backup data saat ini sebagai pengaman.
+- **Auto Backup Harian** (opsional, 03:00): file backup lengkap dikirim ke semua admin.
+- Simpan file backup dengan aman, karena berisi data member & pembayaran.
+- Restore ke bot dengan token berbeda: upload ulang gambar QRIS (ID file Telegram terikat ke bot).
+- Batas ukuran file restore 20 MB (limit Telegram untuk bot).
+
 ## Alur verifikasi
 Pembeli kirim bukti → bot kirim foto + detail ke semua admin → admin cek mutasi lalu tekan
 **✅ Setujui** (link dikirim otomatis) atau **❌ Tolak** (pilih alasan; pembeli bisa kirim ulang bukti).
