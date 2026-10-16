@@ -39,6 +39,31 @@
 4. (Opsional) Isi nama toko, pesan welcome, kontak support, kode promo.
 5. Tes: buka akun lain → /start → beli → kirim bukti → setujui dari akun admin.
 
+## 🎁 Trial gratis (hitungan menit)
+1. `/admin` → **🎁 Trial Gratis**.
+2. **🔗 Atur Channel Trial** → pilih channel yang boleh dimasuki saat trial (wajib minimal 1).
+3. **⏱ Ubah Durasi** → isi menit (1–1440), lalu **🟢 Aktifkan Trial**.
+- Tombol "🎁 Coba Gratis" muncul di menu utama untuk member baru (belum pernah trial/beli).
+- 1 akun hanya bisa trial **1x**.
+- Saat waktu habis, bot otomatis mengeluarkan user dari channel lalu mengirim ajakan **Lanjutkan ke Pembayaran**.
+- Pengecekan berjalan tiap 1 menit, jadi kick bisa terlambat maksimal ±1 menit.
+- Jika user membeli paket saat trial masih berjalan, masa paket dihitung mulai saat itu.
+
+## 🔗 Link channel khusus per paket
+Contoh: Paket A → Link 1 & 3, Paket B → Link 2, Paket C → Link 4.
+1. Tambahkan semua channel dulu di **📢 Channel & Link**.
+2. `/admin` → **📦 Paket** → pilih paket → **🔗 Atur Channel Paket**.
+3. Ketuk channel untuk memilih (✅) / membatalkan (⬜).
+- Paket yang belum diatur otomatis mendapat **semua channel aktif** (default).
+- Bot hanya mengirim link & menerima join request sesuai channel paket pembeli.
+- Jika pembeli ganti paket, channel paket lama yang tidak ada di paket baru otomatis di-kick.
+- Detail paket di sisi pembeli menampilkan nama channel yang didapat.
+
+## 🧹 Reset statistik & riwayat
+`/admin` → **⚙️ Pengaturan** → **🧹 Reset Data**
+- **📊 Reset Statistik**: angka pendapatan & penjualan mulai dari nol, riwayat pesanan tetap aman. Bisa dikembalikan lewat **↩️ Tampilkan Semua Data Lagi**.
+- **🗑 Hapus Riwayat Pesanan**: menghapus permanen pesanan selesai (berhasil/ditolak/dibatalkan/kedaluwarsa). Backup CSV dikirim otomatis sebelum dihapus. Member aktif dan pesanan yang sedang diproses tidak ikut terhapus.
+
 ## Alur verifikasi
 Pembeli kirim bukti → bot kirim foto + detail ke semua admin → admin cek mutasi lalu tekan
 **✅ Setujui** (link dikirim otomatis) atau **❌ Tolak** (pilih alasan; pembeli bisa kirim ulang bukti).
