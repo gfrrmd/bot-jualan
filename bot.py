@@ -418,5 +418,661 @@ def card_text(o):
     u = q("SELECT * FROM users WHERE user_id=?", (o["user_id"],), one=True)
     name = esc(u["name"]) if u else "-"
     uname = f"@{esc(u['username'])}" if u and u["username"] else "tanpa username"
-    s = (f"🔔 <b>PEMBAYARAN BARU · {inv(o['id'])}</b>\n\n"
-         f"👤 <a hr
+    link = '<a href="tg://user?id=%d">%s</a>' % (o["user_id"], name)
+    s = "🔔 <b>PEMBAYARAN BARU · %s</b>\n\n" % inv(o["id"])
+    s += "👤 %s (%s)\n" % (link, uname)
+    s += "🆔 <code>%s</code>\n" % o["user_id"]
+    s += "📦 %s · %s hari\n" % (esc(o["plan_name"]), o["days"])
+    s += "💰 Nominal yang harus masuk: <b>%s</b>\n" % rp(o["total"])
+    if o["unique_code"]:
+        s += f"    (harga {rp(o['base'] - o['discount'])} + kode unik {o['unique_code']})\n"
+    if o["promo"]:
+        s += f"🏷 Promo: {esc(o['promo'])} (-{rp(o['discount'])})\n"
+    if o["proof_at"]:
+        s += f"🕒 Bukti dikirim: {fmt_dt(o['proof_at'])}\n"
+    s += "\n"
+    if o["status"] == "review":
+        s += "⏳ <i>Cek mutasi/riwayat dana masuk, lalu pilih tindakan di bawah.</i>"
+    elif o["status"] == "paid":
+        s += f"✅ <b>DISETUJUI</b> oleh {esc(o['reviewed_by'])}"
+    elif o["status"] == "rejected":
+        s += f"❌ <b>DITOLAK</b> oleh {esc(o['reviewed_by'])}\nAlasan: {esc(o['reason'])}"
+    else:
+        s += STATUS.get(o["status"], "")
+    return s
+
+
+async def send_review_card(ctx, chat_id, o):
+    kb = Kb([[Btn("✅ Setujui", callback_data=f"a:ok:{o['id']}"), Btn("❌ Tolak", callback_data=f"a:no:{o['id']}")]])
+    send = ctx.bot.send_photo if o["proof_type"] == "photo" else ctx.bot.send_document
+    msg = await send(chat_id, o["proof_id"], caption=card_text(o), parse_mode=HTML, reply_markup=kb)
+    ex("INSERT INTO admin_msgs VALUES(?,?,?)", (o["id"], chat_id, msg.message_id))
+
+
+async def notify_admins(ctx, oid):
+    o = get_order(oid)
+    for a in ADMIN_IDS:
+        try:
+            await send_review_card(ctx, a, o)
+        except TelegramError as e:
+            log.warning("notif admin %s gagal: %s", a, e)
+
+
+async def refresh_admin_msgs(ctx, oid):
+    o = get_order(oid)
+    for r in q("SELECT * FROM admin_msgs WHERE order_id=?", (oid,)):
+        try:
+            await ctx.bot.edit_message_caption(r["chat_id"], r["message_id"], caption=card_text(o),
+                                               parse_mode=HTML, reply_markup=None)
+        except TelegramError:
+            pass
+
+
+REASONS = {"1": "Nominal pembayaran tidak sesuai", "2": "Bukti tidak valid / tidak terbaca",
+           "3": "Dana belum masuk ke rekening kami"}
+
+
+async def reject_order(ctx, oid, admin_name, reason):
+    cur = ex("UPDATE orders SET status='rejected',reviewed_by=?,reviewed_at=?,reason=? WHERE id=? AND status='review'",
+             (admin_name, now(), reason, oid))
+    if cur.rowcount == 0:
+        return False
+    o = get_order(oid)
+    await refresh_admin_msgs(ctx, oid)
+    rows = [[Btn("🔁 Kirim Ulang Bukti", callback_data=f"retry:{oid}")]]
+    if support_btn():
+        rows.append(support_btn())
+    try:
+        await ctx.bot.send_message(o["user_id"], f"❌ <b>Pembayaran Belum Dapat Diverifikasi</b>\n\nPesanan: <b>{inv(oid)}</b>\n"
+                                   f"Alasan: {esc(reason)}\n\nSilakan kirim ulang bukti yang benar atau hubungi admin.",
+                                   parse_mode=HTML, reply_markup=Kb(rows))
+    except TelegramError:
+        pass
+    return True
+
+
+# ───────────────────────── Callback router ─────────────────────────
+async def on_cb(update: Update, ctx):
+    cq = update.callback_query
+    p = (cq.data or "").split(":")
+    uid = cq.from_user.id
+    touch(cq.from_user)
+    if p[0] == "a":
+        if not is_admin(uid):
+            return await cq.answer("Akses ditolak", show_alert=True)
+        return await admin_cb(update, ctx, p[1:])
+    await cq.answer()
+    k = p[0]
+    if k == "home":
+        ctx.user_data.clear()
+        await show_home(update, ctx)
+    elif k == "plans":
+        await show_plans(update, ctx)
+    elif k == "plan":
+        ctx.user_data.pop("await_promo", None)
+        await show_plan(update, ctx, int(p[1]))
+    elif k == "promo":
+        ctx.user_data["await_promo"] = int(p[1])
+        await show(update, ctx, "🏷 <b>Kode Promo</b>\n\nKetik kode promo Anda di chat ini.",
+                   Kb([[Btn("⬅ Batal", callback_data=f"plan:{p[1]}")]]))
+    elif k == "buy":
+        await create_order(update, ctx, int(p[1]))
+    elif k == "cancel":
+        ex("UPDATE orders SET status='cancelled' WHERE id=? AND user_id=? AND status='pending'", (int(p[1]), uid))
+        try:
+            await cq.message.delete()
+        except TelegramError:
+            pass
+        await ctx.bot.send_message(uid, "🚫 Pesanan dibatalkan. Anda bisa membuat pesanan baru kapan saja.",
+                                   reply_markup=Kb([[Btn("🛒 Beli Akses VIP", callback_data="plans")]]))
+    elif k == "retry":
+        o = get_order(int(p[1]))
+        if o and o["user_id"] == uid and o["status"] == "rejected":
+            ex("UPDATE orders SET status='pending',expires_at=? WHERE id=?", (now() + 3600, o["id"]))
+            await show(update, ctx, f"📸 Silakan kirim <b>screenshot bukti pembayaran</b> yang benar untuk <b>{inv(o['id'])}</b> "
+                                    f"(total {rp(o['total'])}) ke chat ini.", None)
+    elif k == "subs":
+        await show_subs(update, ctx)
+    elif k == "orders":
+        await show_orders(update, ctx)
+    elif k == "help":
+        await show_help(update, ctx)
+    elif k == "getlink":
+        if not active_sub(uid):
+            return await show_subs(update, ctx)
+        await send_access(ctx, uid, "🔑 <b>Link Akses Anda</b>")
+
+
+# ───────────────────────── Admin panel ─────────────────────────
+def back(to="a:home", label="⬅ Panel Admin"): return [Btn(label, callback_data=to)]
+
+
+async def admin_home(update, ctx):
+    ctx.user_data.pop("st", None)
+    pend = q("SELECT COUNT(*) c FROM orders WHERE status='review'", one=True)["c"]
+    act = q("SELECT COUNT(*) c FROM subs WHERE active=1 AND end_ts>?", (now(),), one=True)["c"]
+    text = (f"🛠 <b>Panel Admin · {esc(gs('shop'))}</b>\n\n🧾 Menunggu verifikasi: <b>{pend}</b>\n👥 Member aktif: <b>{act}</b>")
+    kb = Kb([[Btn("📊 Statistik", callback_data="a:stats"), Btn(f"🧾 Pending ({pend})", callback_data="a:pend")],
+             [Btn("📦 Paket", callback_data="a:plans"), Btn("📢 Channel & Link", callback_data="a:ch")],
+             [Btn("👥 Member", callback_data="a:mem"), Btn("🏷 Promo", callback_data="a:promo")],
+             [Btn("📣 Broadcast", callback_data="a:bc"), Btn("⚙️ Pengaturan", callback_data="a:set")],
+             [Btn("📥 Export CSV", callback_data="a:csv"), Btn("⬅ Menu Utama", callback_data="home")]])
+    await show(update, ctx, text, kb)
+
+
+async def cmd_admin(update, ctx):
+    if not is_admin(update.effective_user.id):
+        return
+    touch(update.effective_user)
+    await admin_home(update, ctx)
+
+
+async def cmd_cancel(update, ctx):
+    ctx.user_data.clear()
+    await update.message.reply_text("Dibatalkan.")
+
+
+def member_card(uid):
+    u = q("SELECT * FROM users WHERE user_id=?", (uid,), one=True)
+    if not u:
+        return None, None
+    s = q("SELECT * FROM subs WHERE user_id=?", (uid,), one=True)
+    st = q("SELECT COUNT(*) c, COALESCE(SUM(total),0) t FROM orders WHERE user_id=? AND status='paid'", (uid,), one=True)
+    status = (f"✅ Aktif s/d {fmt_d(s['end_ts'])}" if s and s["active"] and s["end_ts"] > now() else "⚪ Tidak aktif")
+    text = (f"👤 <b>{esc(u['name'])}</b> (@{esc(u['username'] or '-')})\n🆔 <code>{uid}</code>\n"
+            f"Langganan: {status}\nTotal pembelian: {st['c']}x · {rp(st['t'])}\nBergabung: {fmt_d(u['created_at'])}")
+    kb = Kb([[Btn("🎁 Beri Akses", callback_data=f"a:gp:{uid}"), Btn("🚫 Cabut Akses", callback_data=f"a:rv:{uid}")],
+             back("a:mem", "⬅ Member")])
+    return text, kb
+
+
+async def admin_cb(update, ctx, p):
+    cq = update.callback_query
+    k = p[0]
+    if k not in ("ok", "rj"):
+        await cq.answer()
+    adm = cq.from_user.full_name
+    # ── Home / cancel
+    if k in ("home", "cancel"):
+        return await admin_home(update, ctx)
+    # ── Statistik
+    if k == "stats":
+        d = datetime.now(TZ)
+        t0 = int(d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        m0 = int(d.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+        def rev(since): return q("SELECT COALESCE(SUM(total),0) t, COUNT(*) c FROM orders WHERE status='paid' AND reviewed_at>=?", (since,), one=True)
+        a, b, c = rev(t0), rev(m0), rev(0)
+        users = q("SELECT COUNT(*) c FROM users", one=True)["c"]
+        buyers = q("SELECT COUNT(DISTINCT user_id) c FROM orders WHERE status='paid'", one=True)["c"]
+        act = q("SELECT COUNT(*) c FROM subs WHERE active=1 AND end_ts>?", (now(),), one=True)["c"]
+        exp3 = q("SELECT COUNT(*) c FROM subs WHERE active=1 AND end_ts BETWEEN ? AND ?", (now(), now() + 3 * 86400), one=True)["c"]
+        top = q("SELECT plan_name, COUNT(*) c FROM orders WHERE status='paid' GROUP BY plan_name ORDER BY c DESC LIMIT 3")
+        text = (f"📊 <b>Statistik Penjualan</b>\n\n💵 Hari ini: <b>{rp(a['t'])}</b> ({a['c']} order)\n"
+                f"📅 Bulan ini: <b>{rp(b['t'])}</b> ({b['c']} order)\n🏦 Total: <b>{rp(c['t'])}</b> ({c['c']} order)\n\n"
+                f"👥 Total user: {users}\n🛍 Pembeli: {buyers} ({(buyers * 100 // users) if users else 0}% konversi)\n"
+                f"✅ Member aktif: {act}\n⏰ Berakhir ≤3 hari: {exp3}\n")
+        if top:
+            text += "\n🏆 <b>Paket terlaris</b>\n" + "\n".join(f"• {esc(t['plan_name'])} — {t['c']}x" for t in top)
+        return await show(update, ctx, text, Kb([back()]))
+    # ── Pending
+    if k == "pend":
+        rows = q("SELECT * FROM orders WHERE status='review' ORDER BY id")
+        if not rows:
+            return await show(update, ctx, "🧾 Tidak ada pembayaran yang menunggu verifikasi. 🎉", Kb([back()]))
+        await show(update, ctx, f"🧾 Mengirim {len(rows)} pembayaran pending di bawah 👇", Kb([back()]))
+        for o in rows:
+            await send_review_card(ctx, cq.from_user.id, o)
+        return
+    # ── Setujui / Tolak
+    if k == "ok":
+        oid = int(p[1])
+        cur = ex("UPDATE orders SET status='paid',reviewed_by=?,reviewed_at=? WHERE id=? AND status='review'", (adm, now(), oid))
+        if cur.rowcount == 0:
+            await cq.answer("Pesanan ini sudah diproses.", show_alert=True)
+            return await refresh_admin_msgs(ctx, oid)
+        o = get_order(oid)
+        end = activate(o["user_id"], o["plan_name"], o["days"])
+        if o["promo"]:
+            ex("UPDATE promos SET used=used+1 WHERE code=?", (o["promo"],))
+        await cq.answer("Disetujui ✅")
+        await refresh_admin_msgs(ctx, oid)
+        head = (f"🎉 <b>Pembayaran Berhasil!</b>\n\nTerima kasih, pesanan <b>{inv(oid)}</b> telah disetujui.\n\n"
+                f"📦 Paket: {esc(o['plan_name'])}\n📅 Aktif hingga: <b>{fmt_dt(end)}</b>")
+        fails, has_links = await send_access(ctx, o["user_id"], head)
+        if fails or not has_links:
+            msg = ("⚠️ Pesanan %s disetujui, tapi link belum terkirim untuk: %s.\nPastikan bot adalah <b>admin</b> channel dengan izin "
+                   "<i>Invite Users via Link</i>, lalu minta member tekan <b>Ambil Link Akses</b>."
+                   % (inv(oid), esc(", ".join(fails) if fails else "belum ada channel terdaftar")))
+            await ctx.bot.send_message(cq.from_user.id, msg, parse_mode=HTML)
+        return
+    if k == "no":
+        oid = int(p[1])
+        kb = Kb([[Btn(v, callback_data=f"a:rj:{oid}:{i}")] for i, v in REASONS.items()] +
+                [[Btn("✍️ Tulis alasan sendiri", callback_data=f"a:rj:{oid}:0")],
+                 [Btn("⬅ Batal", callback_data=f"a:bk:{oid}")]])
+        try:
+            await cq.edit_message_reply_markup(kb)
+        except TelegramError:
+            pass
+        return
+    if k == "bk":
+        oid = int(p[1])
+        try:
+            await cq.edit_message_reply_markup(Kb([[Btn("✅ Setujui", callback_data=f"a:ok:{oid}"),
+                                                    Btn("❌ Tolak", callback_data=f"a:no:{oid}")]]))
+        except TelegramError:
+            pass
+        return
+    if k == "rj":
+        oid, rid = int(p[1]), p[2]
+        o = get_order(oid)
+        if not o or o["status"] != "review":
+            await cq.answer("Pesanan ini sudah diproses.", show_alert=True)
+            return await refresh_admin_msgs(ctx, oid)
+        if rid == "0":
+            await cq.answer()
+            ctx.user_data["st"] = {"k": "reason", "oid": oid}
+            return await ctx.bot.send_message(cq.from_user.id, f"✍️ Ketik alasan penolakan untuk <b>{inv(oid)}</b>:\n(/cancel untuk batal)",
+                                              parse_mode=HTML)
+        await reject_order(ctx, oid, adm, REASONS[rid])
+        return await cq.answer("Ditolak ❌")
+    # ── Paket
+    if k == "plans":
+        rows = q("SELECT * FROM plans ORDER BY price")
+        kb = [[Btn(f"{'🟢' if r['active'] else '⚪'} {r['name']} · {rp(r['price'])} · {r['days']}h", callback_data=f"a:plan:{r['id']}")] for r in rows]
+        kb += [[Btn("➕ Tambah Paket", callback_data="a:pnew")], back()]
+        return await show(update, ctx, "📦 <b>Kelola Paket</b>\n\nPilih paket untuk diedit, atau tambah paket baru.", Kb(kb))
+    if k == "plan":
+        r = get_plan(int(p[1]))
+        if not r:
+            return await admin_cb(update, ctx, ["plans"])
+        text = (f"📦 <b>{esc(r['name'])}</b>\n💰 {rp(r['price'])}\n⏱ {r['days']} hari\n📝 {esc(r['description'] or '-')}\n"
+                f"Status: {'🟢 Aktif' if r['active'] else '⚪ Nonaktif'}")
+        i = r["id"]
+        kb = Kb([[Btn("✏️ Nama", callback_data=f"a:pe:{i}:name"), Btn("✏️ Harga", callback_data=f"a:pe:{i}:price")],
+                 [Btn("✏️ Durasi", callback_data=f"a:pe:{i}:days"), Btn("✏️ Deskripsi", callback_data=f"a:pe:{i}:desc")],
+                 [Btn("🔛 Aktif/Nonaktif", callback_data=f"a:pt:{i}"), Btn("🗑 Hapus", callback_data=f"a:pd:{i}")],
+                 back("a:plans", "⬅ Daftar Paket")])
+        return await show(update, ctx, text, kb)
+    if k == "pnew":
+        ctx.user_data["st"] = {"k": "plan_new"}
+        return await show(update, ctx, "➕ <b>Tambah Paket</b>\n\nKirim dengan format:\n<code>Nama | Harga | Durasi(hari) | Deskripsi</code>\n\n"
+                                       "Contoh:\n<code>VIP 30 Hari | 99000 | 30 | Akses semua channel + update harian</code>",
+                          Kb([back("a:plans", "⬅ Batal")]))
+    if k == "pe":
+        ctx.user_data["st"] = {"k": "plan_edit", "id": int(p[1]), "f": p[2]}
+        names = {"name": "nama", "price": "harga (angka)", "days": "durasi (hari)", "desc": "deskripsi"}
+        return await show(update, ctx, f"✏️ Kirim <b>{names[p[2]]}</b> baru:", Kb([back(f"a:plan:{p[1]}", "⬅ Batal")]))
+    if k == "pt":
+        ex("UPDATE plans SET active=1-active WHERE id=?", (int(p[1]),))
+        return await admin_cb(update, ctx, ["plan", p[1]])
+    if k == "pd":
+        return await show(update, ctx, "🗑 Yakin hapus paket ini?", Kb([[Btn("Ya, hapus", callback_data=f"a:pdy:{p[1]}"),
+                                                                       Btn("Batal", callback_data=f"a:plan:{p[1]}")]]))
+    if k == "pdy":
+        ex("DELETE FROM plans WHERE id=?", (int(p[1]),))
+        return await admin_cb(update, ctx, ["plans"])
+    # ── Channel & Link
+    if k == "ch":
+        rows = q("SELECT * FROM channels ORDER BY id")
+        text = "📢 <b>Channel &amp; Link Akses</b>\n\n"
+        text += "\n".join(f"{'🟢' if r['active'] else '⚪'} <b>{esc(r['title'])}</b> — {'🔐 link unik otomatis' if r['chat_id'] else '⚠️ link statis'}"
+                          for r in rows) if rows else "Belum ada channel."
+        text += ("\n\n<i>Tips: tambahkan channel via Chat ID/forward agar bot membuat link unik per pembeli "
+                 "(anti-bocor). Bot harus jadi admin channel dengan izin Invite Users.</i>")
+        kb = [[Btn(f"{'⚪ Nonaktifkan' if r['active'] else '🟢 Aktifkan'} {r['title'][:14]}", callback_data=f"a:cht:{r['id']}"),
+               Btn("🔍", callback_data=f"a:chc:{r['id']}"), Btn("🗑", callback_data=f"a:chd:{r['id']}")] for r in rows]
+        kb += [[Btn("➕ Tambah Channel / Link", callback_data="a:chnew")], back()]
+        return await show(update, ctx, text, Kb(kb))
+    if k == "chnew":
+        ctx.user_data["st"] = {"k": "ch_new"}
+        return await show(update, ctx, "➕ <b>Tambah Channel</b>\n\nPilih salah satu cara:\n"
+                                       "1️⃣ <b>Forward</b> 1 pesan dari channel tersebut ke sini (disarankan)\n"
+                                       "2️⃣ Kirim <code>Nama | -100123456789</code> atau <code>Nama | @usernamechannel</code>\n"
+                                       "3️⃣ Link statis: <code>Nama | https://t.me/+abcd</code> (kurang aman)",
+                          Kb([back("a:ch", "⬅ Batal")]))
+    if k == "cht":
+        ex("UPDATE channels SET active=1-active WHERE id=?", (int(p[1]),))
+        return await admin_cb(update, ctx, ["ch"])
+    if k == "chd":
+        ex("DELETE FROM channels WHERE id=?", (int(p[1]),))
+        return await admin_cb(update, ctx, ["ch"])
+    if k == "chc":
+        r = q("SELECT * FROM channels WHERE id=?", (int(p[1]),), one=True)
+        if not r or not r["chat_id"]:
+            return await cq.answer("Link statis — tidak ada yang dicek.", show_alert=True)
+        ok, info = await check_bot_in_channel(ctx, r["chat_id"])
+        return await cq.answer(("✅ Bot siap: " if ok else "❌ ") + info, show_alert=True)
+    # ── Member
+    if k == "mem":
+        rows = q("SELECT s.*, u.name, u.username FROM subs s LEFT JOIN users u USING(user_id) WHERE s.active=1 AND s.end_ts>? "
+                 "ORDER BY s.end_ts LIMIT 25", (now(),))
+        text = "👥 <b>Member Aktif</b> (urut paling cepat habis)\n\n"
+        text += "\n".join(f"• {esc(r['name'])} (<code>{r['user_id']}</code>) — {fmt_d(r['end_ts'])}" for r in rows) if rows else "Belum ada member aktif."
+        return await show(update, ctx, text, Kb([[Btn("🔎 Cari / Kelola Member", callback_data="a:find")], back()]))
+    if k == "find":
+        ctx.user_data["st"] = {"k": "find"}
+        return await show(update, ctx, "🔎 Kirim <b>User ID</b> atau <b>@username</b> member:", Kb([back("a:mem", "⬅ Batal")]))
+    if k == "mc":
+        text, kb = member_card(int(p[1]))
+        return await show(update, ctx, text, kb)
+    if k == "gp":
+        plans = q("SELECT * FROM plans WHERE active=1")
+        kb = [[Btn(f"{r['name']} ({r['days']} hari)", callback_data=f"a:gr:{p[1]}:{r['id']}")] for r in plans]
+        kb.append(back(f"a:mc:{p[1]}", "⬅ Batal"))
+        return await show(update, ctx, "🎁 Pilih paket yang akan diberikan <b>gratis/manual</b>:", Kb(kb))
+    if k == "gr":
+        uid, plan = int(p[1]), get_plan(int(p[2]))
+        end = activate(uid, plan["name"], plan["days"])
+        await send_access(ctx, uid, f"🎁 <b>Akses VIP Diberikan</b>\n\n📦 Paket: {esc(plan['name'])}\n📅 Aktif hingga: <b>{fmt_dt(end)}</b>")
+        return await admin_cb(update, ctx, ["mc", p[1]])
+    if k == "rv":
+        uid = int(p[1])
+        ex("UPDATE subs SET active=0 WHERE user_id=?", (uid,))
+        await remove_from_channels(ctx, uid)
+        try:
+            await ctx.bot.send_message(uid, "ℹ️ Akses VIP Anda telah dinonaktifkan oleh admin.")
+        except TelegramError:
+            pass
+        return await admin_cb(update, ctx, ["mc", p[1]])
+    # ── Promo
+    if k == "promo":
+        rows = q("SELECT * FROM promos ORDER BY code")
+        text = "🏷 <b>Kode Promo</b>\n\n" + ("\n".join(f"• <code>{r['code']}</code> — {r['percent']}% · terpakai {r['used']}/{r['max_uses'] or '∞'}" for r in rows) if rows else "Belum ada promo.")
+        kb = [[Btn(f"🗑 {r['code']}", callback_data=f"a:prd:{r['code']}")] for r in rows]
+        kb += [[Btn("➕ Buat Promo", callback_data="a:prnew")], back()]
+        return await show(update, ctx, text, Kb(kb))
+    if k == "prnew":
+        ctx.user_data["st"] = {"k": "promo_new"}
+        return await show(update, ctx, "➕ Kirim: <code>KODE | Persen | MaksPemakaian</code>\nContoh: <code>HEMAT20 | 20 | 50</code>\n(0 = tanpa batas)",
+                          Kb([back("a:promo", "⬅ Batal")]))
+    if k == "prd":
+        ex("DELETE FROM promos WHERE code=?", (p[1],))
+        return await admin_cb(update, ctx, ["promo"])
+    # ── Broadcast
+    if k == "bc":
+        kb = Kb([[Btn("📢 Semua user", callback_data="a:bct:all")],
+                 [Btn("✅ Member aktif", callback_data="a:bct:active")],
+                 [Btn("🔄 Member expired (ajak perpanjang)", callback_data="a:bct:expired")],
+                 [Btn("🎯 Belum pernah beli (promo)", callback_data="a:bct:never")], back()])
+        return await show(update, ctx, "📣 <b>Broadcast</b>\n\nPilih target penerima:", kb)
+    if k == "bct":
+        ctx.user_data["st"] = {"k": "bc", "t": p[1]}
+        return await show(update, ctx, "✍️ Kirim pesan yang ingin di-broadcast (teks / foto + caption).\nSaya tampilkan preview dulu sebelum dikirim.",
+                          Kb([back("a:bc", "⬅ Batal")]))
+    if k == "bcgo":
+        st = ctx.user_data.pop("st", None)
+        if not st or st.get("k") != "bc_ready":
+            return
+        ids = broadcast_targets(st["t"])
+        await cq.edit_message_text(f"🚀 Broadcast dimulai ke {len(ids)} user...")
+        ctx.application.create_task(run_broadcast(ctx, cq.from_user.id, ids, st["chat"], st["msg"]))
+        return
+    # ── Pengaturan
+    if k == "set":
+        text = (f"⚙️ <b>Pengaturan</b>\n\n🏪 Nama toko: {esc(gs('shop'))}\n💬 Support: {esc(gs('support') or '-')}\n"
+                f"⏳ Batas bayar: {gs('expiry')} menit\n🔢 Kode unik: {'ON' if gs('unique') == '1' else 'OFF'}\n"
+                f"🖼 QRIS: {'✅ terpasang' if gs('qris') else '❌ belum diatur'}\n👋 Welcome: {esc((gs('welcome') or '(default)')[:60])}")
+        kb = Kb([[Btn("🖼 Ganti QRIS", callback_data="a:s:qris"), Btn("🏪 Nama Toko", callback_data="a:s:shop")],
+                 [Btn("👋 Pesan Welcome", callback_data="a:s:welcome"), Btn("💬 Kontak Support", callback_data="a:s:support")],
+                 [Btn("⏳ Batas Bayar", callback_data="a:s:expiry"), Btn("🔢 Kode Unik ON/OFF", callback_data="a:s:uq")], back()])
+        return await show(update, ctx, text, kb)
+    if k == "s":
+        key = p[1]
+        if key == "uq":
+            ss("unique", "0" if gs("unique") == "1" else "1")
+            return await admin_cb(update, ctx, ["set"])
+        ctx.user_data["st"] = {"k": "qris"} if key == "qris" else {"k": "set", "key": key}
+        prompts = {"qris": "🖼 Kirim <b>gambar QRIS</b> (sebagai foto).", "shop": "🏪 Kirim nama toko/brand.",
+                   "welcome": "👋 Kirim pesan sambutan (kirim <code>-</code> untuk reset default).",
+                   "support": "💬 Kirim username admin support, mis. <code>@adminku</code> (kirim <code>-</code> untuk hapus).",
+                   "expiry": "⏳ Kirim batas waktu bayar dalam <b>menit</b>, mis. <code>30</code>."}
+        return await show(update, ctx, prompts[key], Kb([back("a:set", "⬅ Batal")]))
+    # ── CSV
+    if k == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["invoice", "user_id", "paket", "total", "status", "dibuat", "diverifikasi", "oleh", "promo"])
+        for o in q("SELECT * FROM orders ORDER BY id"):
+            w.writerow([inv(o["id"]), o["user_id"], o["plan_name"], o["total"], o["status"], fmt_dt(o["created_at"]),
+                        fmt_dt(o["reviewed_at"]) if o["reviewed_at"] else "", o["reviewed_by"] or "", o["promo"] or ""])
+        f = io.BytesIO(buf.getvalue().encode())
+        f.name = f"orders_{datetime.now(TZ):%Y%m%d}.csv"
+        await ctx.bot.send_document(cq.from_user.id, f, caption="📥 Export semua pesanan")
+
+
+async def check_bot_in_channel(ctx, chat_id):
+    try:
+        m = await ctx.bot.get_chat_member(chat_id, ctx.bot.id)
+        if m.status != ChatMemberStatus.ADMINISTRATOR:
+            return False, "bot belum jadi admin channel"
+        if not getattr(m, "can_invite_users", False):
+            return False, "izin 'Invite Users via Link' belum aktif"
+        return True, "bot admin & izin lengkap"
+    except TelegramError as e:
+        return False, f"tidak bisa akses channel ({e})"
+
+
+def broadcast_targets(t):
+    if t == "active":
+        r = q("SELECT user_id FROM subs WHERE active=1 AND end_ts>?", (now(),))
+    elif t == "expired":
+        r = q("SELECT s.user_id FROM subs s JOIN users u USING(user_id) WHERE u.blocked=0 AND (s.active=0 OR s.end_ts<=?)", (now(),))
+    elif t == "never":
+        r = q("SELECT user_id FROM users WHERE blocked=0 AND user_id NOT IN (SELECT user_id FROM orders WHERE status='paid')")
+    else:
+        r = q("SELECT user_id FROM users WHERE blocked=0")
+    return [x["user_id"] for x in r]
+
+
+async def run_broadcast(ctx, admin_id, ids, chat, msg):
+    ok = fail = 0
+    for uid in ids:
+        for attempt in range(2):
+            try:
+                await ctx.bot.copy_message(uid, chat, msg)
+                ok += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Forbidden:
+                ex("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
+                fail += 1
+                break
+            except TelegramError:
+                fail += 1
+                break
+        await asyncio.sleep(0.06)
+    await ctx.bot.send_message(admin_id, f"📣 <b>Broadcast selesai</b>\n✅ Terkirim: {ok}\n❌ Gagal: {fail}", parse_mode=HTML)
+
+
+# ───────────────────────── Input teks admin (state) ─────────────────────────
+async def admin_input(update, ctx):
+    st, m = ctx.user_data["st"], update.message
+    t = (m.text or "").strip()
+    k = st["k"]
+    reply = lambda s, **kw: m.reply_text(s, parse_mode=HTML, **kw)
+    done_kb = Kb([[Btn("🛠 Panel Admin", callback_data="a:home")]])
+
+    if k == "qris":
+        if not m.photo:
+            await reply("Kirim QRIS sebagai <b>foto</b> ya.")
+            return True
+        ss("qris", m.photo[-1].file_id)
+        ctx.user_data.pop("st")
+        await reply("✅ QRIS berhasil diperbarui.", reply_markup=done_kb)
+        return True
+    if k == "bc":
+        ctx.user_data["st"] = {"k": "bc_ready", "t": st["t"], "chat": m.chat_id, "msg": m.message_id}
+        await reply(f"👆 <b>Preview</b> — target: <b>{st['t']}</b> ({len(broadcast_targets(st['t']))} user). Kirim sekarang?",
+                    reply_markup=Kb([[Btn("🚀 Kirim", callback_data="a:bcgo"), Btn("❌ Batal", callback_data="a:home")]]),
+                    reply_to_message_id=m.message_id)
+        return True
+    if k == "ch_new":
+        title = chat_id = url = None
+        fo = getattr(m, "forward_origin", None)
+        if fo is not None and getattr(fo, "chat", None):
+            chat_id, title = fo.chat.id, fo.chat.title
+        elif t:
+            parts = [x.strip() for x in t.split("|")]
+            title, val = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
+            if val.lstrip("-").isdigit():
+                chat_id = int(val)
+            elif val.startswith("@"):
+                chat_id = val
+            elif val.startswith("http"):
+                url = val
+        if chat_id is None and not url:
+            await reply("Format tidak dikenali. Forward pesan channel atau gunakan format yang dicontohkan.")
+            return True
+        if chat_id is not None:
+            try:
+                chat = await ctx.bot.get_chat(chat_id)
+            except TelegramError as e:
+                await reply(f"❌ Channel tidak ditemukan / bot belum ditambahkan: {esc(e)}")
+                return True
+            chat_id, title = chat.id, title or chat.title
+            ok, info = await check_bot_in_channel(ctx, chat_id)
+            if not ok:
+                await reply(f"❌ {esc(info)}.\nJadikan bot admin channel dengan izin <b>Invite Users via Link</b>, lalu coba lagi.")
+                return True
+        ex("INSERT INTO channels(title,chat_id,url) VALUES(?,?,?)", (title or "Channel VIP", chat_id, url))
+        ctx.user_data.pop("st")
+        await reply(f"✅ <b>{esc(title or 'Channel VIP')}</b> ditambahkan." + ("" if chat_id else "\n⚠️ Link statis bisa dibagikan pembeli; disarankan pakai Chat ID."),
+                    reply_markup=Kb([[Btn("📢 Daftar Channel", callback_data="a:ch")]]))
+        return True
+    if not t:
+        return False
+    if k == "reason":
+        ctx.user_data.pop("st")
+        ok = await reject_order(ctx, st["oid"], update.effective_user.full_name, t[:200])
+        await reply("❌ Pesanan ditolak & pembeli diberi tahu." if ok else "Pesanan ini sudah diproses.", reply_markup=done_kb)
+        return True
+    if k == "plan_new":
+        parts = [x.strip() for x in t.split("|")]
+        if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            await reply("Format salah. Contoh: <code>VIP 30 Hari | 99000 | 30 | Deskripsi</code>")
+            return True
+        ex("INSERT INTO plans(name,price,days,description) VALUES(?,?,?,?)",
+           (parts[0], int(parts[1]), int(parts[2]), parts[3] if len(parts) > 3 else ""))
+        ctx.user_data.pop("st")
+        await reply("✅ Paket ditambahkan.", reply_markup=Kb([[Btn("📦 Daftar Paket", callback_data="a:plans")]]))
+        return True
+    if k == "plan_edit":
+        col = {"name": "name", "price": "price", "days": "days", "desc": "description"}[st["f"]]
+        val = t
+        if st["f"] in ("price", "days"):
+            if not t.isdigit():
+                await reply("Masukkan angka saja.")
+                return True
+            val = int(t)
+        ex(f"UPDATE plans SET {col}=? WHERE id=?", (val, st["id"]))
+        ctx.user_data.pop("st")
+        await reply("✅ Paket diperbarui.", reply_markup=Kb([[Btn("📦 Lihat Paket", callback_data=f"a:plan:{st['id']}")]]))
+        return True
+    if k == "promo_new":
+        parts = [x.strip() for x in t.split("|")]
+        try:
+            code, pct, mx = parts[0].upper().replace(" ", ""), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
+            assert code.isalnum() and 1 <= pct <= 99
+        except Exception:
+            await reply("Format salah. Contoh: <code>HEMAT20 | 20 | 50</code> (persen 1–99)")
+            return True
+        ex("INSERT INTO promos(code,percent,max_uses) VALUES(?,?,?) ON CONFLICT(code) DO UPDATE SET percent=excluded.percent,"
+           "max_uses=excluded.max_uses,active=1", (code, pct, mx))
+        ctx.user_data.pop("st")
+        await reply(f"✅ Promo <code>{code}</code> aktif.", reply_markup=Kb([[Btn("🏷 Daftar Promo", callback_data="a:promo")]]))
+        return True
+    if k == "set":
+        key, val = st["key"], t
+        if key == "expiry":
+            if not t.isdigit() or not 5 <= int(t) <= 1440:
+                await reply("Masukkan angka menit (5–1440).")
+                return True
+        if key in ("welcome", "support") and t == "-":
+            val = ""
+        ss(key, val)
+        ctx.user_data.pop("st")
+        await reply("✅ Pengaturan disimpan.", reply_markup=Kb([[Btn("⚙️ Pengaturan", callback_data="a:set")]]))
+        return True
+    if k == "find":
+        r = q("SELECT user_id FROM users WHERE user_id=? OR lower(username)=lower(?)",
+              (int(t) if t.lstrip("-").isdigit() else 0, t.lstrip("@")), one=True)
+        if not r:
+            await reply("User tidak ditemukan (user harus pernah /start bot).")
+            return True
+        ctx.user_data.pop("st")
+        text, kb = member_card(r["user_id"])
+        await reply(text, reply_markup=kb)
+        return True
+    return False
+
+
+async def on_message(update: Update, ctx):
+    m, u = update.message, update.effective_user
+    touch(u)
+    if is_admin(u.id) and ctx.user_data.get("st"):
+        if await admin_input(update, ctx):
+            return
+    if ctx.user_data.get("await_promo") and m.text:
+        return await handle_promo(update, ctx)
+    if m.photo or (m.document and (m.document.mime_type or "").startswith("image/")):
+        return await handle_proof(update, ctx)
+    await show_home(update, ctx)
+
+
+# ───────────────────────── Jobs otomatis ─────────────────────────
+async def maintenance(ctx: ContextTypes.DEFAULT_TYPE):
+    # invoice kedaluwarsa
+    for o in q("SELECT * FROM orders WHERE status='pending' AND expires_at<?", (now(),)):
+        ex("UPDATE orders SET status='expired' WHERE id=?", (o["id"],))
+        try:
+            await ctx.bot.send_message(o["user_id"], f"⌛ Invoice <b>{inv(o['id'])}</b> telah kedaluwarsa. Buat pesanan baru kapan saja 👇",
+                                       parse_mode=HTML, reply_markup=Kb([[Btn("🛒 Beli Akses VIP", callback_data="plans")]]))
+        except TelegramError:
+            pass
+    # pengingat H-3
+    for s in q("SELECT * FROM subs WHERE active=1 AND reminded=0 AND end_ts BETWEEN ? AND ?", (now(), now() + 3 * 86400)):
+        ex("UPDATE subs SET reminded=1 WHERE user_id=?", (s["user_id"],))
+        try:
+            await ctx.bot.send_message(s["user_id"], f"⏰ <b>Pengingat</b>\n\nAkses VIP Anda berakhir pada <b>{fmt_dt(s['end_ts'])}</b>.\n"
+                                       "Perpanjang sekarang agar akses tidak terputus — sisa hari tetap dihitung! 🎁",
+                                       parse_mode=HTML, reply_markup=Kb([[Btn("🔄 Perpanjang Sekarang", callback_data="plans")]]))
+        except TelegramError:
+            pass
+    # langganan habis → keluarkan dari channel
+    for s in q("SELECT * FROM subs WHERE active=1 AND end_ts<=?", (now(),)):
+        ex("UPDATE subs SET active=0 WHERE user_id=?", (s["user_id"],))
+        await remove_from_channels(ctx, s["user_id"])
+        try:
+            await ctx.bot.send_message(s["user_id"], "⌛ <b>Masa aktif VIP Anda telah berakhir.</b>\n\nTerima kasih sudah bergabung! "
+                                       "Perpanjang untuk kembali mendapat akses 👇", parse_mode=HTML,
+                                       reply_markup=Kb([[Btn("🔄 Perpanjang Sekarang", callback_data="plans")]]))
+        except TelegramError:
+            pass
+
+
+async def on_error(update, ctx):
+    log.error("Error: %s", ctx.error, exc_info=ctx.error)
+
+
+def main():
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS kosong! Set env ADMIN_IDS agar admin bisa memakai bot.")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(on_cb))
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+    app.add_error_handler(on_error)
+    app.job_queue.run_repeating(maintenance, interval=900, first=30)
+    log.info("Bot berjalan. DB: %s", DB_PATH)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
+
