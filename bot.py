@@ -357,17 +357,28 @@ def can_access(uid, chat_id):
     return bool(sub) and any(c["chat_id"] == chat_id for c in plan_channels(sub["plan_id"]))
 
 
-def trial_eligible(uid):
-    if gs("trial_on") != "1" or not plan_channels(0):
-        return False
+def trial_reason(uid):
+    """None jika boleh trial; selain itu alasan kenapa tombol trial tidak muncul."""
+    if gs("trial_on") != "1":
+        return "Trial belum diaktifkan"
+    if not plan_channels(0):
+        return "Channel trial belum dipilih (atau channel-nya nonaktif)"
     u = q("SELECT trial_used FROM users WHERE user_id=?", (uid,), one=True)
-    if not u or u["trial_used"] or active_sub(uid):
-        return False
+    if not u:
+        return "Akun belum pernah /start"
+    if u["trial_used"]:
+        return "Sudah pernah memakai trial"
+    if active_sub(uid):
+        return "Sedang punya langganan aktif"
     if q("SELECT 1 FROM orders WHERE user_id=? AND status='paid'", (uid,), one=True):
-        return False
+        return "Sudah pernah membeli"
     if q("SELECT 1 FROM subs WHERE user_id=? AND is_trial=0", (uid,), one=True):
-        return False
-    return True
+        return "Pernah punya langganan berbayar/manual"
+    return None
+
+
+def trial_eligible(uid):
+    return trial_reason(uid) is None
 
 
 async def show_trial(update, ctx):
@@ -687,8 +698,10 @@ def member_card(uid):
     st = q("SELECT COUNT(*) c, COALESCE(SUM(total),0) t FROM orders WHERE user_id=? AND status='paid'", (uid,), one=True)
     status = (f"✅ Aktif s/d {fmt_d(s['end_ts'])}" if s and s["active"] and s["end_ts"] > now() else "⚪ Tidak aktif")
     text = (f"👤 <b>{esc(u['name'])}</b> (@{esc(u['username'] or '-')})\n🆔 <code>{uid}</code>\n"
-            f"Langganan: {status}\nTotal pembelian: {st['c']}x · {rp(st['t'])}\nBergabung: {fmt_d(u['created_at'])}")
+            f"Langganan: {status}\nTotal pembelian: {st['c']}x · {rp(st['t'])}\nBergabung: {fmt_d(u['created_at'])}\n"
+            f"Trial: {'✅ bisa dipakai' if not trial_reason(uid) else '❌ ' + trial_reason(uid)}")
     kb = Kb([[Btn("🎁 Beri Akses", callback_data=f"a:gp:{uid}"), Btn("🚫 Cabut Akses", callback_data=f"a:rv:{uid}")],
+             [Btn("♻️ Reset Trial User Ini", callback_data=f"a:rt:{uid}")],
              back("a:mem", "⬅ Member")])
     return text, kb
 
@@ -908,6 +921,9 @@ async def admin_cb(update, ctx, p):
                 "<i>1 akun hanya bisa trial 1x. Setelah waktu habis, member otomatis dikeluarkan lalu diajak membayar.</i>")
         if on and not names:
             text += "\n\n⚠️ Pilih channel trial dulu agar tombol trial muncul untuk pembeli."
+        why = trial_reason(cq.from_user.id)
+        text += ("\n\n🔎 <b>Cek akun Anda:</b> " + ("✅ tombol trial akan muncul (kirim /start)" if not why else f"❌ {esc(why)}")
+                 + "\n<i>Untuk tes, gunakan akun Telegram lain yang belum pernah membeli.</i>")
         kb = Kb([[Btn("⚪ Matikan Trial" if on else "🟢 Aktifkan Trial", callback_data="a:trt")],
                  [Btn("⏱ Ubah Durasi (menit)", callback_data="a:trm")],
                  [Btn("🔗 Atur Channel Trial", callback_data="a:pc:0")], back()])
@@ -950,6 +966,15 @@ async def admin_cb(update, ctx, p):
             await ctx.bot.send_message(uid, "ℹ️ Akses VIP Anda telah dinonaktifkan oleh admin.")
         except TelegramError:
             pass
+        return await admin_cb(update, ctx, ["mc", p[1]])
+    if k == "rt":
+        uid_ = int(p[1])
+        ex("UPDATE users SET trial_used=0 WHERE user_id=?", (uid_,))
+        t_ = q("SELECT * FROM subs WHERE user_id=? AND is_trial=1", (uid_,), one=True)
+        if t_:
+            ex("DELETE FROM subs WHERE user_id=? AND is_trial=1", (uid_,))
+            if t_["active"]:
+                await remove_from_channels(ctx, uid_)
         return await admin_cb(update, ctx, ["mc", p[1]])
     # ── Promo
     if k == "promo":
