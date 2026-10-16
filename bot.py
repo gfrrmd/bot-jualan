@@ -4,14 +4,17 @@ Stack: python-telegram-bot 21.x, SQLite. Siap deploy di Railway (worker).
 """
 import asyncio
 import csv
+import json
 import html
 import io
 import logging
 import os
 import random
+import shutil
 import sqlite3
+import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Kb, Update
@@ -34,7 +37,7 @@ HTML = ParseMode.HTML
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.row_factory = sqlite3.Row
 _db.execute("PRAGMA journal_mode=WAL")
-_db.executescript("""
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY, username TEXT, name TEXT,
     created_at INTEGER, blocked INTEGER DEFAULT 0);
@@ -53,15 +56,23 @@ CREATE TABLE IF NOT EXISTS promos(code TEXT PRIMARY KEY, percent INTEGER, max_us
     used INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS admin_msgs(order_id INTEGER, chat_id INTEGER, message_id INTEGER);
 CREATE TABLE IF NOT EXISTS plan_channels(plan_id INTEGER, channel_id INTEGER, PRIMARY KEY(plan_id, channel_id));
-""")
-for _ddl in ("ALTER TABLE subs ADD COLUMN plan_id INTEGER",
-             "ALTER TABLE subs ADD COLUMN is_trial INTEGER DEFAULT 0",
-             "ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0"):
-    try:
-        _db.execute(_ddl)
-    except sqlite3.OperationalError:
-        pass  # kolom sudah ada
-_db.commit()
+"""
+MIGRATIONS = ("ALTER TABLE subs ADD COLUMN plan_id INTEGER",
+              "ALTER TABLE subs ADD COLUMN is_trial INTEGER DEFAULT 0",
+              "ALTER TABLE users ADD COLUMN trial_used INTEGER DEFAULT 0")
+
+
+def init_db():
+    _db.executescript(SCHEMA)
+    for ddl in MIGRATIONS:
+        try:
+            _db.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # kolom sudah ada
+    _db.commit()
+
+
+init_db()
 
 
 def q(sql, args=(), one=False):
@@ -77,7 +88,7 @@ def ex(sql, args=()):
 
 
 DEFAULTS = {"shop": "VIP Premium", "welcome": "", "support": "", "qris": "",
-            "expiry": "30", "unique": "1", "trial_on": "0", "trial_min": "10", "stats_since": "0"}
+            "expiry": "30", "unique": "1", "trial_on": "0", "trial_min": "10", "stats_since": "0", "auto_backup": "0"}
 
 
 def gs(key):
@@ -674,6 +685,7 @@ async def admin_home(update, ctx):
              [Btn("👥 Member", callback_data="a:mem"), Btn("🏷 Promo", callback_data="a:promo")],
              [Btn("📣 Broadcast", callback_data="a:bc"), Btn("⚙️ Pengaturan", callback_data="a:set")],
              [Btn("🎁 Trial Gratis", callback_data="a:tr"), Btn("📥 Export CSV", callback_data="a:csv")],
+             [Btn("💾 Backup & Restore", callback_data="a:bak")],
              [Btn("⬅ Menu Utama", callback_data="home")]])
     await show(update, ctx, text, kb)
 
@@ -1030,6 +1042,52 @@ async def admin_cb(update, ctx, p):
                    "support": "💬 Kirim username admin support, mis. <code>@adminku</code> (kirim <code>-</code> untuk hapus).",
                    "expiry": "⏳ Kirim batas waktu bayar dalam <b>menit</b>, mis. <code>30</code>."}
         return await show(update, ctx, prompts[key], Kb([back("a:set", "⬅ Batal")]))
+    # ── Backup & Restore
+    if k == "bak":
+        ctx.user_data.pop("st", None)
+        auto = gs("auto_backup") == "1"
+        text = ("💾 <b>Backup &amp; Restore</b>\n\n"
+                "• <b>Backup Lengkap (.db)</b> — semua data: pengaturan, paket, channel, promo, member, langganan &amp; pesanan.\n"
+                "• <b>Backup Pengaturan (.json)</b> — hanya pengaturan, paket, channel, promo.\n"
+                "• <b>Restore</b> — kirim file backup ke bot ini, lalu konfirmasi.\n\n"
+                f"🔔 Auto backup harian (03:00): <b>{'ON' if auto else 'OFF'}</b>\n\n"
+                "<i>Simpan file backup dengan aman — berisi data member &amp; pembayaran. "
+                "Jika restore ke bot dengan token berbeda, upload ulang gambar QRIS.</i>")
+        kb = Kb([[Btn("💾 Backup Lengkap (.db)", callback_data="a:bdb")],
+                 [Btn("⚙️ Backup Pengaturan (.json)", callback_data="a:bjs")],
+                 [Btn("📥 Restore dari File", callback_data="a:brs")],
+                 [Btn("🔕 Matikan Auto Backup" if auto else "🔔 Aktifkan Auto Backup Harian", callback_data="a:bau")], back()])
+        return await show(update, ctx, text, kb)
+    if k == "bdb":
+        await send_db_backup(ctx, cq.from_user.id, f"💾 Backup lengkap · {datetime.now(TZ):%d/%m/%Y %H:%M}")
+        return
+    if k == "bjs":
+        await ctx.bot.send_document(cq.from_user.id, make_json_backup(), caption="⚙️ Backup pengaturan (paket, channel, promo, setelan)")
+        return
+    if k == "bau":
+        ss("auto_backup", "0" if gs("auto_backup") == "1" else "1")
+        return await admin_cb(update, ctx, ["bak"])
+    if k == "brs":
+        ctx.user_data["st"] = {"k": "restore"}
+        return await show(update, ctx, "📥 <b>Restore</b>\n\nKirim file backup (<b>.db</b> atau <b>.json</b>) ke chat ini sebagai dokumen.",
+                          Kb([back("a:bak", "⬅ Batal")]))
+    if k == "bgo":
+        st = ctx.user_data.pop("st", None)
+        if not st or st.get("k") != "restore_ready":
+            return await show(update, ctx, "Sesi restore kedaluwarsa. Ulangi dari menu Backup & Restore.", Kb([back("a:bak", "⬅ Backup")]))
+        try:
+            await send_db_backup(ctx, cq.from_user.id, "💾 Backup data SEBELUM restore (simpan untuk rollback)")
+            if st["kind"] == "db":
+                restore_db_file(st["path"])
+            else:
+                restore_json(json.load(open(st["path"], encoding="utf8")))
+        except Exception as e:
+            log.exception("restore gagal")
+            return await show(update, ctx, f"❌ Restore gagal: {esc(e)}\nBackup data sebelumnya sudah dikirim di atas.", Kb([back("a:bak", "⬅ Backup")]))
+        finally:
+            shutil.rmtree(os.path.dirname(st["path"]), ignore_errors=True)
+        return await show(update, ctx, "✅ <b>Restore berhasil!</b>\n\nCek paket, channel &amp; QRIS di panel admin. "
+                                       "Jika QRIS tidak muncul pada invoice, upload ulang di Pengaturan.", Kb([back()]))
     # ── Reset data
     if k == "rs":
         done = q("SELECT COUNT(*) c FROM orders WHERE status IN ('paid','rejected','cancelled','expired')", one=True)["c"]
@@ -1071,6 +1129,131 @@ async def admin_cb(update, ctx, p):
     if k == "csv":
         await ctx.bot.send_document(cq.from_user.id, orders_csv(), caption="📥 Export semua pesanan")
         return
+
+
+JSON_TABLES = ("settings", "plans", "channels", "plan_channels", "promos")
+
+
+def make_db_backup_file():
+    """Salinan database yang konsisten (aman walau bot sedang berjalan)."""
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, f"vipbot_backup_{datetime.now(TZ):%Y%m%d_%H%M}.db")
+    dst = sqlite3.connect(path)
+    try:
+        _db.backup(dst)
+    finally:
+        dst.close()
+    return d, path
+
+
+async def send_db_backup(ctx, chat_id, caption):
+    d, path = make_db_backup_file()
+    try:
+        with open(path, "rb") as f:
+            await ctx.bot.send_document(chat_id, f, filename=os.path.basename(path), caption=caption)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def make_json_backup():
+    data = {"app": "vipbot", "version": 1, "created": now(),
+            "tables": {t: [dict(r) for r in q(f"SELECT * FROM {t}")] for t in JSON_TABLES}}
+    f = io.BytesIO(json.dumps(data, ensure_ascii=False, indent=1).encode("utf8"))
+    f.name = f"vipbot_pengaturan_{datetime.now(TZ):%Y%m%d_%H%M}.json"
+    return f
+
+
+def restore_json(data):
+    try:
+        for t in JSON_TABLES:
+            cols = {r["name"] for r in _db.execute(f"PRAGMA table_info({t})").fetchall()}
+            _db.execute(f"DELETE FROM {t}")
+            for row in data["tables"][t]:
+                keys = [k for k in row if k in cols]
+                _db.execute(f"INSERT INTO {t}({','.join(keys)}) VALUES({','.join('?' * len(keys))})", [row[k] for k in keys])
+        _db.commit()
+    except Exception:
+        _db.rollback()
+        raise
+
+
+def restore_db_file(path):
+    src = sqlite3.connect(path)
+    try:
+        src.backup(_db)
+    finally:
+        src.close()
+    init_db()
+
+
+def inspect_backup(path, kind):
+    """Validasi file backup. Return (ok, teks_ringkasan_atau_error)."""
+    try:
+        if kind == "db":
+            c = sqlite3.connect(path)
+            try:
+                if c.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    return False, "File database rusak."
+                tabs = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {"settings", "users", "plans", "channels", "orders", "subs"} <= tabs:
+                    return False, "Ini bukan file backup bot ini."
+                n = lambda sql: c.execute(sql).fetchone()[0]
+                return True, (f"📦 Paket: {n('SELECT COUNT(*) FROM plans')}\n📢 Channel: {n('SELECT COUNT(*) FROM channels')}\n"
+                              f"👥 User: {n('SELECT COUNT(*) FROM users')}\n🧾 Pesanan: {n('SELECT COUNT(*) FROM orders')}\n"
+                              f"✅ Member aktif: {n('SELECT COUNT(*) FROM subs WHERE active=1')}")
+            finally:
+                c.close()
+        data = json.load(open(path, encoding="utf8"))
+        if data.get("app") != "vipbot" or not all(isinstance(data["tables"].get(t), list) for t in JSON_TABLES):
+            return False, "Ini bukan file backup pengaturan bot ini."
+        t = data["tables"]
+        return True, (f"🕒 Dibuat: {fmt_dt(data.get('created', now()))}\n📦 Paket: {len(t['plans'])}\n📢 Channel: {len(t['channels'])}\n"
+                      f"🏷 Promo: {len(t['promos'])}\n⚙️ Pengaturan: {len(t['settings'])} item")
+    except Exception as e:
+        return False, f"File tidak dapat dibaca ({esc(e)})."
+
+
+async def handle_restore_file(update, ctx):
+    m = update.message
+    d = m.document
+    if not d:
+        await m.reply_text("Kirim file backup (<b>.db</b> atau <b>.json</b>) sebagai dokumen.\n/cancel untuk batal.", parse_mode=HTML)
+        return True
+    name = (d.file_name or "").lower()
+    kind = "db" if name.endswith(".db") else "json" if name.endswith(".json") else None
+    if not kind:
+        await m.reply_text("Format harus <b>.db</b> (backup lengkap) atau <b>.json</b> (backup pengaturan).", parse_mode=HTML)
+        return True
+    if d.file_size and d.file_size > 20 * 1024 * 1024:
+        await m.reply_text("File terlalu besar (maks 20 MB untuk bot Telegram).")
+        return True
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "upload." + kind)
+    f = await d.get_file()
+    await f.download_to_drive(path)
+    ok, info = inspect_backup(path, kind)
+    if not ok:
+        shutil.rmtree(tmp, ignore_errors=True)
+        await m.reply_text(f"❌ {info}", parse_mode=HTML)
+        return True
+    ctx.user_data["st"] = {"k": "restore_ready", "path": path, "kind": kind}
+    scope = ("<b>SEMUA data</b> (pengaturan, paket, channel, promo, member &amp; pesanan)" if kind == "db"
+             else "<b>pengaturan, paket, channel &amp; promo</b> (member &amp; pesanan tidak diubah)")
+    await m.reply_text(f"📥 <b>File backup valid</b>\n\n{info}\n\n⚠️ Restore akan <b>menimpa</b> {scope}.\n"
+                       "Backup data saat ini otomatis dikirim dulu sebagai pengaman.",
+                       parse_mode=HTML, reply_markup=Kb([[Btn("✅ Ya, Restore Sekarang", callback_data="a:bgo")],
+                                                         [Btn("❌ Batal", callback_data="a:bak")]]))
+    return True
+
+
+async def auto_backup(ctx):
+    if gs("auto_backup") != "1":
+        return
+    for a in ADMIN_IDS:
+        try:
+            await send_db_backup(ctx, a, "🔔 Auto backup harian")
+        except TelegramError as e:
+            log.warning("auto backup gagal: %s", e)
 
 
 def orders_csv():
@@ -1138,6 +1321,8 @@ async def admin_input(update, ctx):
     reply = lambda s, **kw: m.reply_text(s, parse_mode=HTML, **kw)
     done_kb = Kb([[Btn("🛠 Panel Admin", callback_data="a:home")]])
 
+    if k == "restore":
+        return await handle_restore_file(update, ctx)
     if k == "qris":
         if not m.photo:
             await reply("Kirim QRIS sebagai <b>foto</b> ya.")
@@ -1324,6 +1509,7 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(maintenance, interval=60, first=15)
+    app.job_queue.run_daily(auto_backup, time=dtime(3, 0, tzinfo=TZ))
     log.info("Bot berjalan. DB: %s", DB_PATH)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
