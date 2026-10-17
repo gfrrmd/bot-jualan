@@ -220,6 +220,92 @@ async def show_plan(update, ctx, pid):
     await show(update, ctx, text, kb)
 
 
+async def buy_gate(update, ctx, pid):
+    """Cegah order ganda: jika user belum tercatat tapi sudah ada di channel paket, tanyakan dulu."""
+    uid = update.effective_user.id
+    if not active_sub(uid):
+        inside = await already_in(ctx, uid, plan_channels(pid))
+        if inside:
+            text = (f"ℹ️ <b>Anda sudah tergabung di channel</b>\n\n📢 {esc(', '.join(inside))}\n\n"
+                    "Akun Anda belum tercatat memiliki langganan aktif di sistem kami.\n\n"
+                    "• <b>Member lama</b> (sudah pernah membayar)? Tekan <b>Saya Member Lama</b> — admin akan memverifikasi "
+                    "&amp; mencatat masa aktif Anda <u>tanpa bayar ulang</u>.\n"
+                    "• Ingin tetap <b>memperpanjang</b>? Tekan <b>Lanjut Bayar</b> (tidak perlu join ulang).")
+            return await show(update, ctx, text, Kb([[Btn("🙋 Saya Member Lama", callback_data=f"legacy:{pid}")],
+                                                     [Btn("💳 Lanjut Bayar", callback_data=f"buyforce:{pid}")],
+                                                     [Btn("⬅ Kembali", callback_data=f"plan:{pid}")]]))
+    await create_order(update, ctx, pid)
+
+
+async def legacy_claim(update, ctx, pid):
+    u = update.effective_user
+    last = ctx.user_data.get("legacy_ts", 0)
+    if now() - last < 600:
+        return await show(update, ctx, "⏳ Permintaan Anda sudah dikirim ke admin. Mohon tunggu konfirmasi.",
+                          Kb([[Btn("⬅ Menu Utama", callback_data="home")]]))
+    ctx.user_data["legacy_ts"] = now()
+    inside = await already_in(ctx, u.id, plan_channels(pid))
+    plan = get_plan(pid)
+    text = (f"🙋 <b>KLAIM MEMBER LAMA</b>\n\n👤 <a href=\"tg://user?id={u.id}\">{esc(u.full_name)}</a> "
+            f"({'@' + esc(u.username) if u.username else 'tanpa username'})\n🆔 <code>{u.id}</code>\n"
+            f"✅ Terdeteksi bot sudah ada di: <b>{esc(', '.join(inside) or '-')}</b>\n"
+            f"📦 Paket yang dilihat: {esc(plan['name']) if plan else '-'}\n\n"
+            "Pilih paket untuk <b>mencatat masa aktif</b> (dihitung mulai sekarang), atau tolak:")
+    rows = [[Btn(f"✅ Catat: {p_['name']} ({p_['days']}h)", callback_data=f"a:lg:{u.id}:{p_['id']}")]
+            for p_ in q("SELECT * FROM plans WHERE active=1 ORDER BY price")]
+    rows.append([Btn("❌ Tolak (minta bayar)", callback_data=f"a:lgn:{u.id}")])
+    for a_ in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(a_, text, parse_mode=HTML, reply_markup=Kb(rows))
+        except TelegramError:
+            pass
+    await show(update, ctx, "✅ <b>Permintaan terkirim ke admin.</b>\n\nAdmin akan memverifikasi status member lama Anda. "
+                            "Anda akan menerima notifikasi di sini.", Kb([[Btn("⬅ Menu Utama", callback_data="home")]]))
+
+
+async def run_scan(ctx, admin_id):
+    chans = q("SELECT * FROM channels WHERE active=1 AND chat_id IS NOT NULL")
+    users = q("SELECT user_id,name,username FROM users WHERE blocked=0")
+    found = []
+    for u in users:
+        uid = u["user_id"]
+        if is_admin(uid) or active_sub(uid):
+            continue
+        inside = await already_in(ctx, uid, chans)
+        if inside:
+            found.append((uid, u["name"], u["username"], inside))
+        await asyncio.sleep(0.04)
+    ctx.application.bot_data["legacy"] = [f[0] for f in found]
+    if not found:
+        return await ctx.bot.send_message(admin_id, f"🎉 Selesai memindai {len(users)} user. Tidak ada member lama tanpa langganan.",
+                                          reply_markup=Kb([back("a:mem", "⬅ Member")]))
+    lines = "\n".join(f"• {esc(n)} ({'@' + esc(un) if un else uid_}) — {esc(', '.join(ins))}" for uid_, n, un, ins in found[:30])
+    more = f"\n…dan {len(found) - 30} lainnya" if len(found) > 30 else ""
+    await ctx.bot.send_message(admin_id, f"🔍 <b>Hasil Pemindaian</b> ({len(users)} user dicek)\n\n"
+                               f"Ditemukan <b>{len(found)}</b> user sudah ada di channel tapi belum tercatat langganan:\n\n{lines}{more}",
+                               parse_mode=HTML, reply_markup=Kb([[Btn("✅ Catat Semua Sebagai Member", callback_data="a:scok")],
+                                                                 back("a:mem", "⬅ Batal")]))
+
+
+async def run_legacy_register(ctx, admin_id, uids, plan):
+    ok = 0
+    for uid in uids:
+        if active_sub(uid):
+            continue
+        end, _, _ = activate(uid, plan["id"], plan["name"], days=plan["days"])
+        ok += 1
+        try:
+            await ctx.bot.send_message(uid, f"✅ <b>Status member Anda telah dicatat</b>\n\n📦 Paket: {esc(plan['name'])}\n"
+                                       f"📅 Aktif hingga: <b>{fmt_dt(end)}</b>\n\nAnda tidak perlu membayar ulang atau join ulang.",
+                                       parse_mode=HTML, reply_markup=Kb([[Btn("📦 Langganan Saya", callback_data="subs")]]))
+        except TelegramError:
+            pass
+        await asyncio.sleep(0.05)
+    ctx.application.bot_data["legacy"] = []
+    await ctx.bot.send_message(admin_id, f"✅ {ok} member lama dicatat ke paket <b>{esc(plan['name'])}</b> ({plan['days']} hari).",
+                               parse_mode=HTML, reply_markup=Kb([back("a:mem", "⬅ Member")]))
+
+
 async def create_order(update, ctx, pid):
     cq = update.callback_query
     uid = update.effective_user.id
@@ -396,6 +482,11 @@ async def show_trial(update, ctx):
     if not trial_eligible(update.effective_user.id):
         return await show(update, ctx, "ℹ️ Trial tidak tersedia untuk akun Anda.\nTrial hanya berlaku 1x bagi member baru.",
                           Kb([[Btn("🛒 Lihat Paket VIP", callback_data="plans")], [Btn("⬅ Menu Utama", callback_data="home")]]))
+    inside = await already_in(ctx, update.effective_user.id, plan_channels(0))
+    if inside:
+        return await show(update, ctx, f"ℹ️ Anda sudah tergabung di <b>{esc(', '.join(inside))}</b>, jadi trial tidak diperlukan.\n"
+                                       "Trial hanya untuk calon member baru.",
+                          Kb([[Btn("🛒 Lihat Paket VIP", callback_data="plans")], [Btn("⬅ Menu Utama", callback_data="home")]]))
     names = ", ".join(c["title"] for c in plan_channels(0))
     text = (f"🎁 <b>Coba Gratis {gs('trial_min')} Menit</b>\n\nRasakan langsung kualitas channel VIP kami sebelum berlangganan!\n\n"
             f"📢 Akses: <b>{esc(names)}</b>\n⏱ Durasi: <b>{gs('trial_min')} menit</b>\n\n"
@@ -408,6 +499,8 @@ async def show_trial(update, ctx):
 async def start_trial(update, ctx):
     uid = update.effective_user.id
     if not trial_eligible(uid):
+        return await show_trial(update, ctx)
+    if await already_in(ctx, uid, plan_channels(0)):
         return await show_trial(update, ctx)
     mins = int(gs("trial_min") or 10)
     ex("UPDATE users SET trial_used=1 WHERE user_id=?", (uid,))
@@ -427,16 +520,38 @@ async def start_trial(update, ctx):
                 pass
 
 
+async def already_in(ctx, uid, channels):
+    """Judul channel (dari daftar) yang user-nya SUDAH jadi member — dicek langsung via Telegram."""
+    out = []
+    for c in channels:
+        if not c["chat_id"]:
+            continue
+        for _ in range(2):
+            try:
+                m = await ctx.bot.get_chat_member(c["chat_id"], uid)
+                if m.status == "member" or (m.status == "restricted" and getattr(m, "is_member", False)):
+                    out.append(c["title"])
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramError:
+                break
+    return out
+
+
 async def build_links(ctx, uid):
     """Link unik per user (mode 'request to join') sesuai channel milik paketnya.
     Auto-approve hanya untuk pembeli aktif → link bocor tidak berguna."""
-    links, fails = [], []
+    links, fails, joined = [], [], []
     sub = active_sub(uid)
     if not sub:
-        return links, fails
+        return links, fails, joined
     exp = int(sub["end_ts"]) + 60 if sub["is_trial"] else now() + 86400
     for ch in plan_channels(sub["plan_id"]):
         if ch["chat_id"]:
+            if await already_in(ctx, uid, [ch]):
+                joined.append(ch["title"])  # sudah di dalam channel → tidak perlu link
+                continue
             try:
                 inv_l = await ctx.bot.create_chat_invite_link(ch["chat_id"], name=f"u{uid}"[:32],
                                                               expire_date=exp, creates_join_request=True)
@@ -446,24 +561,26 @@ async def build_links(ctx, uid):
                 fails.append(ch["title"])
         elif ch["url"]:
             links.append((ch["title"], ch["url"]))
-    return links, fails
+    return links, fails, joined
 
 
 async def send_access(ctx, uid, head):
-    links, fails = await build_links(ctx, uid)
+    links, fails, joined = await build_links(ctx, uid)
     rows = [[Btn(f"🔓 Gabung {t}", url=u)] for t, u in links]
     rows.append([Btn("📦 Langganan Saya", callback_data="subs")])
+    if joined:
+        head += f"\n\n✅ Anda <b>sudah tergabung</b> di: <b>{esc(', '.join(joined))}</b> — tidak perlu join ulang."
     if links:
         head += ("\n\n👇 <b>Tekan tombol di bawah untuk bergabung.</b>\nKetuk <i>Request to Join / Minta Bergabung</i> "
                  "→ Anda akan diterima otomatis.\n🔒 <i>Link ini pribadi, hanya akun Anda yang dapat masuk. "
                  "Jangan dibagikan.</i>")
-    else:
+    elif not joined:
         head += "\n\n⏳ Akses channel sedang disiapkan admin. Mohon tunggu sebentar."
     try:
         await ctx.bot.send_message(uid, head, reply_markup=Kb(rows), parse_mode=HTML, protect_content=True)
     except TelegramError as e:
         log.warning("kirim akses gagal: %s", e)
-    return fails, bool(links)
+    return fails, bool(links or joined)
 
 
 async def remove_from_channels(ctx, uid, only=None):
@@ -640,7 +757,11 @@ async def on_cb(update: Update, ctx):
         await show(update, ctx, "🏷 <b>Kode Promo</b>\n\nKetik kode promo Anda di chat ini.",
                    Kb([[Btn("⬅ Batal", callback_data=f"plan:{p[1]}")]]))
     elif k == "buy":
+        await buy_gate(update, ctx, int(p[1]))
+    elif k == "buyforce":
         await create_order(update, ctx, int(p[1]))
+    elif k == "legacy":
+        await legacy_claim(update, ctx, int(p[1]))
     elif k == "cancel":
         ex("UPDATE orders SET status='cancelled' WHERE id=? AND user_id=? AND status='pending'", (int(p[1]), uid))
         try:
@@ -952,7 +1073,8 @@ async def admin_cb(update, ctx, p):
                  "ORDER BY s.end_ts LIMIT 25", (now(),))
         text = "👥 <b>Member Aktif</b> (urut paling cepat habis)\n\n"
         text += "\n".join(f"• {esc(r['name'])} (<code>{r['user_id']}</code>) — {fmt_d(r['end_ts'])}" for r in rows) if rows else "Belum ada member aktif."
-        return await show(update, ctx, text, Kb([[Btn("🔎 Cari / Kelola Member", callback_data="a:find")], back()]))
+        return await show(update, ctx, text, Kb([[Btn("🔎 Cari / Kelola Member", callback_data="a:find")],
+                                                [Btn("🔍 Cek Member Lama di Channel", callback_data="a:sc")], back()]))
     if k == "find":
         ctx.user_data["st"] = {"k": "find"}
         return await show(update, ctx, "🔎 Kirim <b>User ID</b> atau <b>@username</b> member:", Kb([back("a:mem", "⬅ Batal")]))
@@ -1042,6 +1164,62 @@ async def admin_cb(update, ctx, p):
                    "support": "💬 Kirim username admin support, mis. <code>@adminku</code> (kirim <code>-</code> untuk hapus).",
                    "expiry": "⏳ Kirim batas waktu bayar dalam <b>menit</b>, mis. <code>30</code>."}
         return await show(update, ctx, prompts[key], Kb([back("a:set", "⬅ Batal")]))
+    # ── Member lama (sudah di channel tapi belum tercatat)
+    if k == "lg":
+        uid_, pid_ = int(p[1]), int(p[2])
+        plan = get_plan(pid_)
+        if not plan:
+            return
+        if active_sub(uid_):
+            return await cq.edit_message_text("ℹ️ User ini sudah memiliki langganan aktif (sudah diproses).", reply_markup=None)
+        end, _, _ = activate(uid_, plan["id"], plan["name"], days=plan["days"])
+        try:
+            await ctx.bot.send_message(uid_, f"✅ <b>Status member lama Anda telah diverifikasi</b>\n\n📦 Paket: {esc(plan['name'])}\n"
+                                       f"📅 Aktif hingga: <b>{fmt_dt(end)}</b>\n\nAnda tidak perlu membayar ulang atau join ulang.",
+                                       parse_mode=HTML, reply_markup=Kb([[Btn("📦 Langganan Saya", callback_data="subs")]]))
+        except TelegramError:
+            pass
+        return await cq.edit_message_text(f"✅ Dicatat oleh {esc(adm)}: user <code>{uid_}</code> → {esc(plan['name'])} s/d {fmt_d(end)}",
+                                          parse_mode=HTML, reply_markup=None)
+    if k == "lgn":
+        uid_ = int(p[1])
+        try:
+            await ctx.bot.send_message(uid_, "ℹ️ Admin belum dapat memverifikasi status member lama Anda.\n"
+                                       "Silakan lanjut berlangganan, atau hubungi admin bila ada pertanyaan.",
+                                       reply_markup=Kb([[Btn("🛒 Lihat Paket VIP", callback_data="plans")]]))
+        except TelegramError:
+            pass
+        return await cq.edit_message_text(f"❌ Ditolak oleh {esc(adm)}: user <code>{uid_}</code>", parse_mode=HTML, reply_markup=None)
+    if k == "sc":
+        n_ch = q("SELECT COUNT(*) c FROM channels WHERE active=1 AND chat_id IS NOT NULL", one=True)["c"]
+        n_us = q("SELECT COUNT(*) c FROM users WHERE blocked=0", one=True)["c"]
+        text = ("🔍 <b>Cek Member Lama di Channel</b>\n\nBot memeriksa user yang pernah /start apakah <b>sudah ada di channel</b> "
+                "tetapi belum tercatat langganan. Lalu Anda bisa mencatat mereka sekaligus tanpa bayar ulang.\n\n"
+                f"📢 Channel dicek: {n_ch} · 👥 User dicek: {n_us}\n\n"
+                "<i>Batasan Telegram: bot tidak bisa melihat daftar seluruh member channel. Member lama yang belum pernah /start bot "
+                "tidak terdeteksi — minta mereka /start, lalu jalankan pemindaian lagi.</i>")
+        return await show(update, ctx, text, Kb([[Btn("▶️ Mulai Pindai", callback_data="a:scgo")], back("a:mem", "⬅ Member")]))
+    if k == "scgo":
+        await show(update, ctx, "⏳ Memindai... Hasil dikirim di chat ini setelah selesai.", Kb([back("a:mem", "⬅ Member")]))
+        ctx.application.create_task(run_scan(ctx, cq.from_user.id))
+        return
+    if k == "scok":
+        plans = q("SELECT * FROM plans WHERE active=1 ORDER BY price")
+        n = len(ctx.application.bot_data.get("legacy", []))
+        kb = [[Btn(f"{r['name']} ({r['days']} hari)", callback_data=f"a:scp:{r['id']}")] for r in plans] + [back("a:mem", "⬅ Batal")]
+        return await show(update, ctx, f"Pilih paket yang dicatat untuk <b>{n}</b> user (masa aktif dihitung mulai sekarang):", Kb(kb))
+    if k == "scp":
+        n = len(ctx.application.bot_data.get("legacy", []))
+        pl = get_plan(int(p[1]))
+        return await show(update, ctx, f"⚠️ Catat <b>{n}</b> user sebagai member <b>{esc(pl['name'])}</b> selama {pl['days']} hari?\n"
+                                       "Mereka akan menerima notifikasi.",
+                          Kb([[Btn("✅ Ya, Catat", callback_data=f"a:scy:{pl['id']}"), Btn("Batal", callback_data="a:mem")]]))
+    if k == "scy":
+        uids = ctx.application.bot_data.get("legacy", [])
+        pl = get_plan(int(p[1]))
+        await show(update, ctx, f"🚀 Mencatat {len(uids)} user...", Kb([back("a:mem", "⬅ Member")]))
+        ctx.application.create_task(run_legacy_register(ctx, cq.from_user.id, list(uids), pl))
+        return
     # ── Backup & Restore
     if k == "bak":
         ctx.user_data.pop("st", None)
